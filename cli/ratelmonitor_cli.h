@@ -96,6 +96,7 @@ static void print_gpu_usage_row(int usage)
 {
     int bar_percentage = clamp_percent(usage);
 
+    
     printf("%s|%s  GPU Usage   ",
            COLOR_BLUE, COLOR_RESET);
 
@@ -189,6 +190,8 @@ static void callback(ratelmonitor_sample_t *sample, void *user_data)
     printf("%s+-----------------------------------------------------------------------+%s\n\n",
            COLOR_BLUE, COLOR_RESET);
 
+    printf("Press 'Enter' to quit...\n");
+    
     fflush(stdout);
 }
 

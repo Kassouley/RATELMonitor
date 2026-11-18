@@ -17,115 +17,132 @@ static inline uint64_t get_time_ns() {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-static void* ratelmonitor_sampling_thread(void*arg)
+static inline struct timespec timespec_from_ms(uint64_t ms) {
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ms / 1000);
+    ts.tv_nsec = (long)((ms % 1000) * 1000000ULL);
+    return ts;
+}
+
+ratelmonitor_status_t ratelmonitor_sample_once(ratelmonitor_sampling_context_t* ctx)
 {
-    ratelmonitor_sampling_context_t* ctx = arg;
     if (ctx == NULL) {
-        return NULL;
+        return RATELMONITOR_STATUS_INVALID_PTR;
     }
+
+    ratelmonitor_status_t status = RATELMONITOR_STATUS_SUCCESS;
+
+    uint8_t buffer[4096];
+    size_t read = 0;
 
     ratelmonitor_sample_t sample = {0};
     ratelmonitor_gpu_t *gpu = NULL;
 
-    struct timespec interval;
-    interval.tv_sec = (time_t)(ctx->interval_ms / 1000);
-    interval.tv_nsec = (long)((ctx->interval_ms % 1000) * 1000000ULL);
+    for (size_t i = 0; i < ctx->gpu_count; ++i) {
+        gpu = &ctx->gpus[i];
 
-    while (ctx->sampling_active) {
-        for (size_t i = 0; i < ctx->gpu_count; ++i) {
-            sample = (ratelmonitor_sample_t){0};
-            sample.gpu_index = i;
-            gpu = &ctx->gpus[i];
+        sample = (ratelmonitor_sample_t){0};
+        sample.gpu_index = i;
+        sample.gpu = gpu;
+        sample.gpu_power_watts = -1;
+        sample.gpu_vram_used = -1;
+        sample.gpu_usage_percent = -1;
+        sample.timestamp = get_time_ns();
 
-            sample.gpu = gpu;
+        status = RATELMONITOR_STATUS_SUCCESS;
 
-            sample.timestamp = get_time_ns();
+        if (ctx->enabled_sampling_types[RATELMONITOR_SAMPLING_TYPE_GPU_USAGE_PERCENT]) {
+            status = ratelmonitor_read_gpu_sysfs(&gpu->gpu_usage, buffer, &read);
+            if (status != RATELMONITOR_STATUS_SUCCESS) return status;
 
-            if (ctx->enabled_sampling_types[RATELMONITOR_SAMPLING_TYPE_GPU_USAGE_PERCENT]) {
-                ratelmonitor_read_gpu_sysfs(&gpu->gpu_usage, (int64_t*)&sample.gpu_usage_percent);
-            }
-            if (ctx->enabled_sampling_types[RATELMONITOR_SAMPLING_TYPE_GPU_VRAM_USED]) {
-                ratelmonitor_read_gpu_sysfs(&gpu->vram_used, &sample.gpu_vram_used);
-            }
-
-            if (ctx->enabled_sampling_types[RATELMONITOR_SAMPLING_TYPE_POWER]) {
-                ratelmonitor_read_gpu_sysfs(&gpu->power_avg, (int64_t*)&sample.gpu_power_watts);
-                sample.gpu_power_watts /= 1000000; // Convert from microwatts to watts
-            }
-
-            if (ctx->callback != NULL) {
-                ctx->callback(&sample, ctx);
+            if (read > 0) {
+                sample.gpu_usage_percent = strtoll((const char*)buffer, NULL, 10);
             }
         }
 
-        if (ctx->interval_ms != 0) {
-            nanosleep(&interval, NULL);
+        if (ctx->enabled_sampling_types[RATELMONITOR_SAMPLING_TYPE_GPU_VRAM_USED]) {
+            status = ratelmonitor_read_gpu_sysfs(&gpu->vram_used, buffer, &read);
+            if (status != RATELMONITOR_STATUS_SUCCESS) return status;
+
+            if (read > 0) {
+                sample.gpu_vram_used = strtoll((const char*)buffer, NULL, 10);
+            }
+        }
+
+
+        if (ctx->enabled_sampling_types[RATELMONITOR_SAMPLING_TYPE_POWER]) {
+            status = ratelmonitor_read_gpu_sysfs(&gpu->power_avg, buffer, &read);
+            if (status != RATELMONITOR_STATUS_SUCCESS) return status;
+
+            if (read > 0) {
+                sample.gpu_power_watts = strtoll((const char*)buffer, NULL, 10);
+                sample.gpu_power_watts /= 1000000;
+            }
+        }
+
+        if (ctx->callback != NULL) {
+            ctx->callback(&sample, ctx->user_data);
         }
     }
-
-    return NULL;
+    return status;
 }
 
-int ratelmonitor_sampling_init(ratelmonitor_sampling_context_t* ctx, ratelmonitor_gpu_t* gpus, size_t gpu_count)
+ratelmonitor_status_t ratelmonitor_sampling_loop(ratelmonitor_sampling_context_t* ctx, bool (*cb)(ratelmonitor_sampling_context_t* ctx))
 {
-    if (ctx == NULL || gpus == NULL || gpu_count == 0) {
-        return -1;
+    if (ctx == NULL) {
+        return RATELMONITOR_STATUS_INVALID_PTR;
+    }
+    struct timespec sleep_time = timespec_from_ms(ctx->interval_ms);
+
+    ctx->sampling_active = true;
+    while (ctx->sampling_active) {
+        ratelmonitor_status_t status = ratelmonitor_sample_once(ctx);
+        if (status != RATELMONITOR_STATUS_SUCCESS) {
+            return status;
+        }
+
+        if(cb) {
+            bool stop = cb(ctx);
+            if(stop) {
+                ctx->sampling_active = false;
+                break;
+            }
+        }
+
+        nanosleep(&sleep_time, NULL);
+    }
+    return RATELMONITOR_STATUS_SUCCESS;
+}
+
+ratelmonitor_status_t ratelmonitor_sampling_init(ratelmonitor_sampling_context_t* ctx, 
+            ratelmonitor_gpu_t* gpus, size_t gpu_count,
+            uint64_t interval_ms,
+            void (*callback)(ratelmonitor_sample_t*, void*), void* user_data,
+            bool enabled_sampling_types[RATELMONITOR_SAMPLING_TYPE_COUNT])
+{
+    if (ctx == NULL || gpus == NULL) {
+        return RATELMONITOR_STATUS_INVALID_PTR;
+    }
+    if (gpu_count == 0) {
+        return RATELMONITOR_STATUS_INVALID_VALUE;
     }
 
     ctx->gpus = gpus;
     ctx->gpu_count = gpu_count;
     ctx->sampling_active = false;
-    ctx->interval_ms = 0;
-    ctx->callback = NULL;
-    ctx->user_data = NULL;
-    memset(ctx->enabled_sampling_types, 0, sizeof(ctx->enabled_sampling_types));
-
-    return 0;
-}
-
-int ratelmonitor_sampling_start(ratelmonitor_sampling_context_t* ctx, uint64_t interval_ms, 
-    void (*callback)(ratelmonitor_sample_t*, void*), void* user_data,
-    bool enabled_sampling_types[RATELMONITOR_SAMPLING_TYPE_COUNT])
-{
-    int result = 0;
-
-    if (ctx == NULL) {
-        return -1;
-    }
-
     ctx->interval_ms = interval_ms;
     ctx->callback = callback;
     ctx->user_data = user_data;
     memcpy(ctx->enabled_sampling_types, enabled_sampling_types, sizeof(ctx->enabled_sampling_types));
-    ctx->sampling_active = true;
 
-    result = pthread_create(&ctx->sampling_thread, NULL, ratelmonitor_sampling_thread, ctx);
-    if (result != 0) {
-        ctx->sampling_active = false;
-    }
-
-    return result;
+    return RATELMONITOR_STATUS_SUCCESS;
 }
 
-int ratelmonitor_sampling_wait(ratelmonitor_sampling_context_t* ctx)
+ratelmonitor_status_t ratelmonitor_sampling_stop(ratelmonitor_sampling_context_t* ctx)
 {
     if (ctx == NULL) {
-        return -1;
+        return RATELMONITOR_STATUS_INVALID_PTR;
     }
-
-    pthread_join(ctx->sampling_thread, NULL);
-
-    return 0;
-}
-
-int ratelmonitor_sampling_stop(ratelmonitor_sampling_context_t* ctx)
-{
-    if (ctx == NULL) {
-        return -1;
-    }
-
     ctx->sampling_active = false;
-    pthread_join(ctx->sampling_thread, NULL);
-
-    return 0;
+    return RATELMONITOR_STATUS_SUCCESS;
 }

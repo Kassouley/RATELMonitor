@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include <string.h>
 #include <limits.h>
 #include <fcntl.h>
 #include <time.h>
@@ -12,57 +11,73 @@
 #include "ratelmonitor_gpu_sysfs.h"
 
 
-int ratelmonitor_open_gpu_sysfs(ratelmonitor_gpu_sysfs_t* gpu_sysfs, const char *device_path, const char *sysfs_file)
+ratelmonitor_status_t ratelmonitor_open_gpu_sysfs(ratelmonitor_gpu_sysfs_t* gpu_sysfs, const char *device_path, const char *sysfs_file)
 {
+    gpu_sysfs->ready = false;
     if (gpu_sysfs == NULL || device_path == NULL || sysfs_file == NULL)
-        return -1;
+        return RATELMONITOR_STATUS_INVALID_PTR;
+
     char path[PATH_MAX];
-    if (make_path(path, PATH_MAX, device_path, sysfs_file) != 0) {
-        return -1;
-    }
+    MAKE_PATH(path, PATH_MAX, device_path, sysfs_file, "%s");
 
     int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
+    if (fd < 0) return RATELMONITOR_STATUS_OPEN_FAILED;
 
     gpu_sysfs->fd = fd;
-    return 0;
+    gpu_sysfs->ready = true;
+    return RATELMONITOR_STATUS_SUCCESS;
 }
 
-int ratelmonitor_close_gpu_sysfs(ratelmonitor_gpu_sysfs_t *gpu_sysfs)
+ratelmonitor_status_t ratelmonitor_close_gpu_sysfs(ratelmonitor_gpu_sysfs_t *gpu_sysfs)
 {
     if (gpu_sysfs == NULL)
-        return -1;
+        return RATELMONITOR_STATUS_INVALID_PTR;
 
     int fd = gpu_sysfs->fd;
+    gpu_sysfs->ready = false;
     gpu_sysfs->fd = -1;
-    return close(fd);
+    if (fd < 0)
+        return RATELMONITOR_STATUS_NOT_INITIALIZED;
+
+    close(fd);
+    return RATELMONITOR_STATUS_SUCCESS;
 }
 
-int ratelmonitor_read_gpu_sysfs(ratelmonitor_gpu_sysfs_t *gpu_sysfs, int64_t *out)
+ratelmonitor_status_t ratelmonitor_read_gpu_sysfs(ratelmonitor_gpu_sysfs_t *gpu_sysfs, uint8_t buffer[4096], size_t *read)
 {
-    if (gpu_sysfs == NULL || out == NULL)
-        return -1;
+    *read = 0;
+
+    if (gpu_sysfs == NULL || read == NULL || buffer == NULL)
+        return RATELMONITOR_STATUS_INVALID_PTR;
+
+    if (!gpu_sysfs->ready)
+        return RATELMONITOR_STATUS_SUCCESS;
 
     int fd = gpu_sysfs->fd;
-    if (fd < 0) return -1;
+    if (fd < 0) return RATELMONITOR_STATUS_NOT_INITIALIZED;
 
-    uint8_t buffer[4096];
-    ssize_t bytes = pread(fd, buffer, sizeof(buffer), 0);
-    if (bytes < 0) return -1;
-    buffer[bytes - 1] = '\0';
-    parse_unsigned((const char *)buffer, (uint64_t *)out);
+    ssize_t bytes = pread(fd, buffer, 4096, 0);
+    if (bytes <= 0) return RATELMONITOR_STATUS_READ_FAILED;
 
-    return 0;
+    buffer[bytes] = '\0';
+    if (buffer[bytes - 1] == '\n') buffer[bytes - 1] = '\0';
+
+    *read = bytes;
+
+    return RATELMONITOR_STATUS_SUCCESS;
 }
 
 
-int ratelmonitor_gpu_sysfs_open_read_close(const char *device_path, const char *sysfs_file, int64_t *out)
+ratelmonitor_status_t ratelmonitor_gpu_sysfs_orc(const char *device_path, const char *sysfs_file,
+                                                    uint8_t buffer[4096], size_t *read)
 {
+    *read = 0;
     ratelmonitor_gpu_sysfs_t gpu_sysfs = {0};
-    if (ratelmonitor_open_gpu_sysfs(&gpu_sysfs, device_path, sysfs_file) != 0)
-        return -1;
+    ratelmonitor_status_t status = ratelmonitor_open_gpu_sysfs(&gpu_sysfs, device_path, sysfs_file);
+    if (status != RATELMONITOR_STATUS_SUCCESS)
+        return status;
 
-    int res = ratelmonitor_read_gpu_sysfs(&gpu_sysfs, out);
-    ratelmonitor_close_gpu_sysfs(&gpu_sysfs);
-    return res;
+    status = ratelmonitor_read_gpu_sysfs(&gpu_sysfs, buffer, read);
+    ratelmonitor_status_t close_status = ratelmonitor_close_gpu_sysfs(&gpu_sysfs);
+    return status == RATELMONITOR_STATUS_SUCCESS ? close_status : status;
 }

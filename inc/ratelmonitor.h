@@ -3,6 +3,7 @@
 
 #include <limits.h>
 #include <stdint.h>
+#include "ratelmonitor_utils.h"
 
 typedef struct ratelmonitor_gpu_s ratelmonitor_gpu_t;
 
@@ -24,8 +25,8 @@ struct ratelmonitor_gpu_s {
     uint64_t power_cap;
 };
 
-int ratelmonitor_discover_gpus(ratelmonitor_gpu_t **gpus, size_t *count);
+ratelmonitor_status_t ratelmonitor_discover_gpus(ratelmonitor_gpu_t **gpus, size_t *count);
 
-int ratelmonitor_fini(ratelmonitor_gpu_t *gpus, size_t count);
+ratelmonitor_status_t ratelmonitor_fini(ratelmonitor_gpu_t *gpus, size_t count);
 
 #endif // RATELMONITOR_H

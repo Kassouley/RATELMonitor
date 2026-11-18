@@ -22,121 +22,147 @@ typedef struct {
     size_t capacity;
 } ratelmonitor_gpu_list_t;
 
-static int append_gpu(ratelmonitor_gpu_list_t *list, const ratelmonitor_gpu_t *gpu)
+static void close_gpu_resources(ratelmonitor_gpu_t *gpu)
 {
+    ratelmonitor_close_gpu_metrics(&gpu->gpu_metrics);
+    ratelmonitor_close_gpu_sysfs(&gpu->gpu_usage);
+    ratelmonitor_close_gpu_sysfs(&gpu->vram_used);
+    ratelmonitor_close_gpu_sysfs(&gpu->power_avg);
+}
+
+static ratelmonitor_status_t append_gpu(ratelmonitor_gpu_list_t *list, const ratelmonitor_gpu_t *gpu)
+{
+    if (list == NULL || gpu == NULL)
+        return RATELMONITOR_STATUS_INVALID_PTR;
+
     if (list->count == list->capacity) {
         size_t new_capacity = list->capacity == 0 ? 8 : list->capacity * 2;
         ratelmonitor_gpu_t *resized = realloc(list->gpus, new_capacity * sizeof(*list->gpus));
-        if (resized == NULL) return -1;
+        if (resized == NULL) return RATELMONITOR_STATUS_OUT_OF_MEMORY;
         list->gpus = resized;
         list->capacity = new_capacity;
     }
+
     list->gpus[list->count++] = *gpu;
-    return 0;
+    return RATELMONITOR_STATUS_SUCCESS;
 }
 
-static bool for_each_callback(const char *d_name, void *arg)
+#define CALL_TRY(call, on_error) do { \
+    ratelmonitor_status_t s = call; \
+    if (s != RATELMONITOR_STATUS_SUCCESS) { on_error; } \
+} while(0)
+
+#define CALL_STOP(call, on_error) do { \
+    ratelmonitor_status_t s = call; \
+    if (s != RATELMONITOR_STATUS_SUCCESS) {on_error; return s; } \
+} while(0)
+
+static ratelmonitor_status_t for_each_callback(const char *d_name, void *arg)
 {
     ratelmonitor_gpu_t gpu = {0};
+    ratelmonitor_gpu_list_t *list = arg;
     char *canonical_device;
 
+    uint8_t buffer[4096];
+    size_t read = 0;
+
     if(!ratelmonitor_is_card_name(d_name)) {
-        return true;
-    }
-    if (ratelmonitor_get_device_path(d_name, gpu.device_path) != 0) {
-        fprintf(stderr, "warning: cannot construct device path for %s (%s)\n", d_name, strerror(errno));
-        return true;
+        return RATELMONITOR_STATUS_CONTINUE;
     }
 
-    if (ratelmonitor_get_canonical_device_path(&canonical_device, gpu.device_path) != 0) {
-        fprintf(stderr, "warning: cannot resolve %s: %s\n", gpu.device_path, strerror(errno));
-        return true;
-    }
+    CALL_STOP(ratelmonitor_get_device_path(d_name, gpu.device_path), {});
+
+    CALL_STOP(ratelmonitor_get_canonical_device_path(&canonical_device, gpu.device_path), {});
 
     if (!ratelmonitor_is_amd_gpu(canonical_device)) {
-        fprintf(stderr, "warning: %s is not an AMD GPU\n", canonical_device);
         free(canonical_device);
-        return true;
+        return RATELMONITOR_STATUS_CONTINUE;
     }
 
-    if (ratelmonitor_parse_dbdf_from_sysfs(canonical_device, &gpu.dbdf) != 0) {
-        fprintf(stderr, "warning: cannot parse DBDF from %s\n", canonical_device);
+    CALL_STOP(ratelmonitor_parse_dbdf_from_sysfs(canonical_device, &gpu.dbdf), {
         free(canonical_device);
-        return true;
-    }
+    });
+       
     free(canonical_device);
 
 
     uint32_t location_id = ratelmonitor_get_location_id_from_dbdf(&gpu.dbdf);
-    if (ratelmonitor_find_kfd_node_id_by_location_id(location_id, &gpu.node_id) != 0) {
-        fprintf(stderr, "warning: cannot find KFD node for %s (location_id 0x%08x)\n", d_name, location_id);
-        return true;
-    }
+    CALL_STOP(ratelmonitor_find_kfd_node_id_by_location_id(location_id, &gpu.node_id), {});
 
-    if (ratelmonitor_get_kfd_node_path(gpu.node_id, gpu.kdf_path) != 0) {
-        fprintf(stderr, "warning: cannot construct KFD node path for %s (node_id 0x%08x)\n", d_name, gpu.node_id);
-        return true;
-    }
+    CALL_STOP(ratelmonitor_get_kfd_node_path(gpu.node_id, gpu.kdf_path), {});
 
-    if (ratelmonitor_open_gpu_metrics(&gpu.gpu_metrics, gpu.device_path) != 0) {
+    CALL_TRY(ratelmonitor_open_gpu_metrics(&gpu.gpu_metrics, gpu.device_path), {
         fprintf(stderr, "warning: cannot open gpu_metrics for %s\n", d_name);
-        return true;
-    }
+    });
 
-    if(ratelmonitor_open_gpu_sysfs(&gpu.gpu_usage, gpu.device_path, "gpu_busy_percent") != 0) {
+    CALL_TRY(ratelmonitor_open_gpu_sysfs(&gpu.gpu_usage, gpu.device_path, "gpu_busy_percent"), {
         fprintf(stderr, "warning: cannot open gpu_usage for %s\n", d_name);
-        return true;
-    }
+    });
 
-    if(ratelmonitor_open_gpu_sysfs(&gpu.vram_used, gpu.device_path, "mem_info_vram_used") != 0) {
-        fprintf(stderr, "warning: cannot open gpu_usage for %s\n", d_name);
-        return true;
-    }
+    CALL_TRY(ratelmonitor_open_gpu_sysfs(&gpu.vram_used, gpu.device_path, "mem_info_vram_used"), {
+        fprintf(stderr, "warning: cannot open vram_used for %s\n", d_name);
+    });
 
-    if(ratelmonitor_open_gpu_sysfs(&gpu.power_avg, gpu.device_path, "hwmon/hwmon1/power1_average") != 0) {
+    CALL_TRY(ratelmonitor_open_gpu_sysfs(&gpu.power_avg, gpu.device_path, "hwmon/hwmon1/power1_average"), {
         fprintf(stderr, "warning: cannot open power_avg for %s\n", d_name);
-        return true;
-    }
+    });
 
-    if(ratelmonitor_gpu_sysfs_open_read_close(gpu.device_path, "mem_info_vram_total", (int64_t*)&gpu.vram_total) != 0) {
+    CALL_TRY(ratelmonitor_gpu_sysfs_orc(gpu.device_path, "mem_info_vram_total", buffer, &read), {
         fprintf(stderr, "warning: cannot read vram total for %s\n", d_name);
-        return true;
+    });
+
+    gpu.vram_total = -1;
+    if (read != 0) {
+        gpu.vram_total = strtoll((const char*)buffer, NULL, 10);
     }
 
-    if(ratelmonitor_gpu_sysfs_open_read_close(gpu.device_path, "hwmon/hwmon1/power1_cap", (int64_t*)&gpu.power_cap) != 0) {
+    CALL_TRY(ratelmonitor_gpu_sysfs_orc(gpu.device_path, "hwmon/hwmon1/power1_cap", buffer, &read), {
         fprintf(stderr, "warning: cannot read power cap for %s\n", d_name);
-        return true;
-    }
-    gpu.power_cap /= 1000000; // convert from uW to W
+    });
 
-    if (append_gpu((ratelmonitor_gpu_list_t *)arg, &gpu) != 0) {
+    gpu.power_cap = -1;
+    if (read != 0) {
+        gpu.power_cap =  strtoll((const char*)buffer, NULL, 10) / 1000000; // convert from uW to W
+    }
+
+    CALL_STOP(append_gpu(list, &gpu), {
         fprintf(stderr, "error: cannot append GPU for %s: %s\n", d_name, strerror(errno));
-        return true;
-    }
+        close_gpu_resources(&gpu);
+    });
 
-    return true;
+    return RATELMONITOR_STATUS_SUCCESS;
 }
 
-int ratelmonitor_discover_gpus(ratelmonitor_gpu_t **gpus, size_t *count)
+ratelmonitor_status_t ratelmonitor_discover_gpus(ratelmonitor_gpu_t **gpus, size_t *count)
 {
+    if (gpus == NULL || count == NULL)
+        return RATELMONITOR_STATUS_INVALID_PTR;
+
+    *gpus = NULL;
+    *count = 0;
     ratelmonitor_gpu_list_t list = {0};
-    int result = for_each_entry_in_dir(DRM_CLASS_PATH, DT_LNK, for_each_callback, &list);
-    if (result != 0) {
+    ratelmonitor_status_t status = for_each_entry_in_dir(DRM_CLASS_PATH, DT_LNK, for_each_callback, &list);
+    
+    if (status != RATELMONITOR_STATUS_SUCCESS) {
         fprintf(stderr, "error: cannot scan %s: %s\n", DRM_CLASS_PATH, strerror(errno));
         free(list.gpus);
-        return result;
+        return status;
     }
+
     *gpus = list.gpus;
     *count = list.count;
-    return 0;
+    return RATELMONITOR_STATUS_SUCCESS;
 }
 
-int ratelmonitor_fini(ratelmonitor_gpu_t *gpus, size_t count)
+
+
+ratelmonitor_status_t ratelmonitor_fini(ratelmonitor_gpu_t *gpus, size_t count)
 {
-    if (gpus == NULL) return -1;
+    if (gpus == NULL) return RATELMONITOR_STATUS_INVALID_PTR;
+    ratelmonitor_status_t status = RATELMONITOR_STATUS_SUCCESS;
     for (size_t i = 0; i < count; ++i) {
-        ratelmonitor_close_gpu_metrics(&gpus[i].gpu_metrics);
+        close_gpu_resources(&gpus[i]);
     }
     free(gpus);
-    return 0;
+    return status;
 }

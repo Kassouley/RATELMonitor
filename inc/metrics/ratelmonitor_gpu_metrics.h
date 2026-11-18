@@ -3,7 +3,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
+#include <stdbool.h>
+#include "ratelmonitor_utils.h"
+#include "ratelmonitor_gpu_sysfs.h"
 
 #define RATELMONITOR_GPU_METRICS_UNKNOWN_LAYOUT {0}
 
@@ -24,10 +26,10 @@ typedef struct ratelmonitor_gpu_metrics_header_s {
 
 
 typedef struct {
-    int fd;
+    ratelmonitor_gpu_sysfs_t sysfs;
     ratelmonitor_gpu_metrics_header_t header;
     ratelmonitor_gpu_metrics_layout_t layout;
-
+	bool ready;
 } ratelmonitor_gpu_metrics_t;
 
 
@@ -94,9 +96,9 @@ typedef struct {
 		.power_is_average = 1 \
 	}
 
-int ratelmonitor_read_gpu_metrics(ratelmonitor_gpu_metrics_t *gpu_metric, ratelmonitor_gpu_metrics_snapshot_t* snapshot);
-int ratelmonitor_get_gpu_socket_power(ratelmonitor_gpu_metrics_snapshot_t* snapshot, uint64_t *power_watts);
-int ratelmonitor_close_gpu_metrics(ratelmonitor_gpu_metrics_t *gpu_metric);
-int ratelmonitor_open_gpu_metrics(ratelmonitor_gpu_metrics_t *gpu_metric, const char *device_path);
+ratelmonitor_status_t ratelmonitor_read_gpu_metrics(ratelmonitor_gpu_metrics_t *gpu_metric, ratelmonitor_gpu_metrics_snapshot_t* snapshot);
+ratelmonitor_status_t ratelmonitor_get_gpu_socket_power(ratelmonitor_gpu_metrics_snapshot_t* snapshot, uint64_t *power_watts);
+ratelmonitor_status_t ratelmonitor_close_gpu_metrics(ratelmonitor_gpu_metrics_t *gpu_metric);
+ratelmonitor_status_t ratelmonitor_open_gpu_metrics(ratelmonitor_gpu_metrics_t *gpu_metric, const char *device_path);
 
 #endif // RATELMONITOR_GPU_METRICS_H
